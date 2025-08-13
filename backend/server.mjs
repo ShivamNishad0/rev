@@ -8,8 +8,9 @@ dotenv.config();
 
 const PORT = process.env.PORT || 3000;
 const GENAI_KEY = process.env.GENAI_API_KEY;
+
 if (!GENAI_KEY) {
-  console.error('Please set GENAI_API_KEY in .env');
+  console.error('❌ Please set GENAI_API_KEY in .env');
   process.exit(1);
 }
 
@@ -18,22 +19,26 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
+// Helper to find audio in Gemini's event payload
 function findAudioInEvent(ev) {
   if (!ev) return null;
-  if (ev.audio?.data) return { data: ev.audio.data, sampleRate: ev.audio.sampleRate || 24000, mimeType: ev.audio.mimeType || 'audio/pcm' };
+  if (ev.audio?.data) return ev.audio;
   if (Array.isArray(ev.outputs)) {
     for (const o of ev.outputs) {
-      if (o?.audio?.data) return { data: o.audio.data, sampleRate: o.audio.sampleRate || 24000, mimeType: o.audio.mimeType || 'audio/pcm' };
+      if (o?.audio?.data) return o.audio;
     }
   }
-  if (ev.response?.audio?.data) return { data: ev.response.audio.data, sampleRate: ev.response.audio.sampleRate || 24000, mimeType: ev.response.audio.mimeType || 'audio/pcm' };
+  if (ev.response?.audio?.data) return ev.response.audio;
   return null;
 }
 
+// Create Gemini live session
 async function createLiveSession(ws) {
   const model = 'models/gemini-2.5-flash-preview-native-audio-dialog';
   const systemInstruction = {
-    parts: [{ text: 'You only answer about Revolt Motors. Politely decline other topics.' }]
+    parts: [
+      { text: 'You only answer about Revolt Motors. Politely decline other topics.' }
+    ]
   };
 
   const callbacks = {
@@ -60,10 +65,12 @@ async function createLiveSession(ws) {
   return await ai.live.connect({ model, config, callbacks });
 }
 
+// WebSocket connection
 wss.on('connection', async (ws) => {
   let session;
   try {
     session = await createLiveSession(ws);
+    console.log("✅ Gemini session started");
   } catch (e) {
     ws.send(JSON.stringify({ type: 'fatal', error: String(e) }));
     ws.close();
@@ -72,19 +79,53 @@ wss.on('connection', async (ws) => {
 
   ws.on('message', async (message) => {
     let obj;
-    try { obj = JSON.parse(message.toString()); } catch { return; }
+    try {
+      obj = JSON.parse(message.toString());
+    } catch {
+      console.warn("⚠️ Received non-JSON message, skipping...");
+      return;
+    }
+
+    console.log("📥 WS message type:", obj.type);
+
     if (obj.type === 'audio') {
-      await session.sendRealtimeInput({ audio: { data: obj.data, mimeType: 'audio/pcm;rate=16000' } });
+      // Validate before sending to Gemini
+      if (
+        !obj.data ||                       // null/undefined
+        typeof obj.data !== 'string' ||    // must be base64
+        obj.data.trim().length < 10        // too short to be valid
+      ) {
+        console.warn("⚠️ Skipping empty or invalid audio chunk");
+        return;
+      }
+
+      console.log("🎤 Sending audio chunk to Gemini, length:", obj.data.length);
+
+      try {
+        await session.sendRealtimeInput({
+          audio: { data: obj.data, mimeType: 'audio/pcm;rate=16000' }
+        });
+      } catch (err) {
+        console.error("❌ Failed to send audio to Gemini:", err.message);
+      }
+
     } else if (obj.type === 'activityEnd') {
+      console.log("🛑 Activity ended by client");
       await session.sendRealtimeInput({ activityEnd: {} });
+
     } else if (obj.type === 'interrupt' || obj.type === 'stopPlayback') {
+      console.log("⏹ Interruption command received");
       if (session.interrupt) await session.interrupt();
     }
   });
 
-  ws.on('close', () => session?.close());
+  ws.on('close', () => {
+    console.log("🔌 WebSocket closed");
+    session?.close();
+  });
 });
 
+// Upgrade HTTP → WS
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws') {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
@@ -93,4 +134,4 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Backend running at http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Backend running at http://localhost:${PORT}`));
